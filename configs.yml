@@ -61,7 +61,7 @@ pubmed:
   num_layers: 2
   weight_decay: 1e-5
   weight_decay_f: 1e-4
-#  max_epoch: 1000
+  max_epoch: 1000
   max_epoch_f: 300
   mask_rate: 0.75
   encoder: gat
