@@ -1,0 +1,8 @@
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed 0 --device 0 --use_cfg
+python main_transductive.py --dataset citeseer --encoder gat --decoder gat --seed 0 --device 0 --use_cfg
+python main_transductive.py --dataset pubmed --encoder gat --decoder gat --seed 0 --device 0 --use_cfg
+python main_inductive.py --dataset ppi --encoder gat --decoder gat --seed 0 --device 2 --use_cfg
+python main_inductive.py --dataset reddit --encoder gat --decoder gat --seed 0 --device 2 --use_cfg
+
+python main_transductive.py --dataset citeseer --encoder gat --decoder gat --seed 0 --device 0 --use_cfg  --start_epoch1 250 --start_epoch2 280 --alpha 0.29
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed 0 --device 0 --use_cfg  --start_epoch1 1000 --start_epoch2 1250
