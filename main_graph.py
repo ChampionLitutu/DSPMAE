@@ -161,8 +161,8 @@ def main(args):
     for i in range(10):
         # seed = random.randint(0, 2 ** 32 - 1)
         # seeds.append(seed)
-        seeds.append(3407)
-        # seeds.append(0)
+        # seeds.append(3407)
+        seeds.append(0)
         # seeds.append(42)
 
     acc_list = []

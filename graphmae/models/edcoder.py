@@ -19,6 +19,8 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import KMeans
 import dgl
+from torch_geometric.utils import add_self_loops, negative_sampling, degree
+from torch.nn import MultiheadAttention
 def topk(
     x: Tensor,
     ratio: Optional[Union[float, int]],
@@ -124,6 +126,19 @@ def setup_module(m_type, enc_dec, in_dim, num_hidden, out_dim, num_layers, dropo
 
     return mod
 
+
+class TransformerLayer(nn.Module):
+    def __init__(self, in_channels, num_heads=4):
+        super(TransformerLayer, self).__init__()
+        self.attention = MultiheadAttention(embed_dim=in_channels, num_heads=num_heads)
+        self.fc = nn.Linear(in_channels, in_channels)  # Keep dimensions consistent
+
+    def forward(self, x):
+        # x.shape: (num_nodes, in_channels)
+        x = x.unsqueeze(1)  # Add batch dimension for MultiheadAttention
+        attn_output, _ = self.attention(x, x, x)
+        attn_output = attn_output.squeeze(1)  # Remove batch dimension
+        return F.relu(self.fc(attn_output))  # Pass through a fully connected layer
 
 class PreModel(nn.Module):
     def __init__(
@@ -234,10 +249,11 @@ class PreModel(nn.Module):
         )
 
         self.loss_weight = nn.Parameter(torch.tensor(1.0))
+        self.loss_weight2 = nn.Parameter(torch.tensor(1.0))
         self.dimReductionMLP = nn.Linear(num_hidden, 256)  # 第一层线性层
         self.dimReductionMLP2 = nn.Linear(256, 128)  # 第二层线性层
-        self._start_epoch1 = start_epoch1
-        self._start_epoch2 = start_epoch2
+        # self._start_epoch1 = start_epoch1
+        # self._start_epoch2 = start_epoch2
         self._alpha = alpha
 
         self.projector_ema = nn.Sequential(
@@ -275,13 +291,21 @@ class PreModel(nn.Module):
         for p in self.projector_ema.parameters():
             p.requires_grad = False
             p.detach_()
-        self._delayed_ema_epoch = 0
+        # self._delayed_ema_epoch = 0
         self.print_num_parameters()
 
         # self._momentum = 0.997
         self._momentum = momentum
         self.alpha_l2 = alpha_l2
         self.prompt_num = prompt_num
+        self.edge_decoder = EdgeDecoder(num_hidden, 64, num_layers = 2, dropout= 0.2)
+        # self._mu = nn.Parameter(torch.tensor(1.0))
+        # self._nu = nn.Parameter(torch.tensor(1.0))
+        # self.std_expander = nn.Sequential(nn.Linear(num_hidden, num_hidden),
+        #                                   nn.PReLU())
+        self.negative_sampler = negative_sampling
+        self.transformer = TransformerLayer(num_hidden, num_heads=4)
+        print("prompt_num:{}".format(prompt_num))
         # self.reset_parameters_for_token()
     def print_num_parameters(self):
         num_encoder_params = [p.numel() for p in self.encoder.parameters() if  p.requires_grad]
@@ -377,14 +401,170 @@ class PreModel(nn.Module):
         out_x[token_nodes] += self.enc_mask_token
         return out_x, (mask_nodes, keep_nodes)
 
-    def forward(self, g, x):
-    # def forward(self, g, x, pr, epoch, max_epoch):
+    # def encoding_mask_noise_diff(self, g, x, mask_rate, difficulty , epoch, max_epoch):
+    #     num_nodes = x.shape[0]
+    #     proportion = 0.5
+    #     sorted_indices = torch.argsort(difficulty).to(x.device)  # 根据难度排序
+    #     g_t = min(1, proportion + (1 - proportion) * (epoch / max_epoch))
+    #
+    #     mask_set_len = int(g_t * num_nodes)
+    #     mask_set = sorted_indices[:mask_set_len]
+    #     num_mask_nodes = int(mask_rate * num_nodes)
+    #
+    #     perm = torch.randperm(mask_set_len, device=x.device)
+    #     mask_nodes_indices = perm[: num_mask_nodes].to(x.device)
+    #     mask_nodes = mask_set[mask_nodes_indices].to(x.device)
+    #     keep_nodes = sorted_indices[~torch.isin(sorted_indices, mask_nodes)]
+    #
+    #     if self._replace_rate > 0:
+    #         num_noise_nodes = int(self._replace_rate * num_mask_nodes)
+    #         perm_mask = torch.randperm(num_mask_nodes, device=x.device)
+    #         token_nodes = mask_nodes[perm_mask[: int(self._mask_token_rate * num_mask_nodes)]]
+    #         noise_nodes = mask_nodes[perm_mask[-int(self._replace_rate * num_mask_nodes):]]
+    #         noise_to_be_chosen = torch.randperm(num_nodes, device=x.device)[:num_noise_nodes]
+    #
+    #         out_x = x.clone()
+    #         out_x[token_nodes] = 0.0
+    #         out_x[noise_nodes] = x[noise_to_be_chosen]
+    #     else:
+    #         # out_x = x.clone()
+    #         # token_nodes = mask_nodes
+    #         out_x = x.clone()
+    #         token_nodes = mask_nodes
+    #         out_x[token_nodes] = 0.0
+    #
+    #     out_x[token_nodes] += self.enc_mask_token
+    #     use_g = g.clone()
+    #     return use_g, out_x, (mask_nodes, keep_nodes)
+    def encoding_mask_noise_diff(self, g, x, mask_rate, difficulty, epoch, max_epoch):
+        num_nodes = x.shape[0]
 
+        # 计算 g(t)
+        max_difficulty = torch.max(difficulty)
+        min_difficulty = torch.min(difficulty)
+        # g_t = min_difficulty + (max_difficulty - min_difficulty) * (epoch / max_epoch)  # 假设epoch最多训练100次
+
+        proportion = 0.5
+        g_t = min(1, proportion + (1 - proportion) * (epoch / max_epoch))
+        mask_nodes = torch.nonzero(difficulty >= g_t).squeeze()
+
+        num_mask_nodes = int(mask_rate * num_nodes)
+        if mask_nodes.ndimension() == 0:
+            # 如果是标量，将其转换为 1D 张量
+            mask_nodes = mask_nodes.unsqueeze(0)
+
+        if mask_nodes.shape[0] > num_mask_nodes:
+            # 如果选择的难度节点数量多于需要掩码的数量，从中随机选择
+            mask_nodes = mask_nodes[torch.randperm(mask_nodes.shape[0])[:num_mask_nodes]].to(x.device)
+        else:
+            # 如果选择的难度节点数量少于需要掩码的数量，补充选择难度较低的节点
+            remaining_indices = torch.nonzero(difficulty < g_t).squeeze()
+            additional_masked_indices = remaining_indices[
+                torch.randperm(len(remaining_indices))[:(num_mask_nodes - mask_nodes.shape[0])]]
+            mask_nodes = torch.cat([mask_nodes, additional_masked_indices]).to(x.device)
+
+        all_nodes = torch.arange(num_nodes, device=x.device)
+        keep_nodes = all_nodes[~torch.isin(all_nodes, mask_nodes)]
+        if self._replace_rate > 0:
+            # 计算噪声节点数量
+            num_noise_nodes = int(self._replace_rate * num_mask_nodes)
+
+            # 随机选择掩码节点中的 token_nodes 和 noise_nodes
+            perm_mask = torch.randperm(num_mask_nodes, device=x.device)
+            token_nodes = mask_nodes[perm_mask[: int(self._mask_token_rate * num_mask_nodes)]]
+            noise_nodes = mask_nodes[perm_mask[-int(self._replace_rate * num_mask_nodes):]]
+
+            # 选择噪声节点
+            noise_to_be_chosen = torch.randperm(num_nodes, device=x.device)[:num_noise_nodes]
+
+            # 处理输出
+            out_x = x.clone()
+            out_x[token_nodes] = 0.0  # 将掩码节点的特征置为0
+            out_x[noise_nodes] = x[noise_to_be_chosen]  # 用噪声节点替换
+
+        else:
+            out_x = x.clone()
+            token_nodes = mask_nodes
+            out_x[token_nodes] = 0.0  # 将掩码节点的特征置为0
+
+        # 添加掩码标记
+        out_x[token_nodes] += self.enc_mask_token
+
+        # 克隆图数据（如果需要对图进行进一步修改）
+        use_g = g.clone()
+
+        return use_g, out_x, (mask_nodes, keep_nodes)
+
+    def encoding_mask_noise_diff_less_proportion(self, g, x, mask_rate, difficulty, epoch, max_epoch):
+        num_nodes = x.shape[0]
+
+        # 计算 g(t)
+        max_difficulty = torch.max(difficulty)
+        min_difficulty = torch.min(difficulty)
+        mid_difficulty= difficulty[int(num_nodes / 2)]
+        g_t = mid_difficulty + (max_difficulty - mid_difficulty) * (epoch / max_epoch)  # 假设epoch最多训练100次
+
+        # proportion = 0.4
+        # g_t = min(1, proportion + (1 - proportion) * (epoch / max_epoch))
+        # # g_t = g_t if g_t < 0.5 else 0.5
+        mask_nodes = torch.nonzero(difficulty >= g_t).squeeze()
+        print(mask_nodes.shape)
+        num_mask_nodes = int(g_t * num_nodes)
+        if mask_nodes.ndimension() == 0:
+            # 如果是标量，将其转换为 1D 张量
+            mask_nodes = mask_nodes.unsqueeze(0)
+
+        if mask_nodes.shape[0] > num_mask_nodes:
+            # 如果选择的难度节点数量多于需要掩码的数量，从中随机选择
+            mask_nodes = mask_nodes[torch.randperm(mask_nodes.shape[0])[:num_mask_nodes]].to(x.device)
+        else:
+            # 如果选择的难度节点数量少于需要掩码的数量，补充选择难度较低的节点
+            remaining_indices = torch.nonzero(difficulty < g_t).squeeze()
+            additional_masked_indices = remaining_indices[
+                torch.randperm(len(remaining_indices))[:(num_mask_nodes - mask_nodes.shape[0])]]
+            mask_nodes = torch.cat([mask_nodes, additional_masked_indices]).to(x.device)
+
+        all_nodes = torch.arange(num_nodes, device=x.device)
+        keep_nodes = all_nodes[~torch.isin(all_nodes, mask_nodes)]
+        if self._replace_rate > 0:
+            # 计算噪声节点数量
+            num_noise_nodes = int(self._replace_rate * num_mask_nodes)
+
+            # 随机选择掩码节点中的 token_nodes 和 noise_nodes
+            perm_mask = torch.randperm(num_mask_nodes, device=x.device)
+            token_nodes = mask_nodes[perm_mask[: int(self._mask_token_rate * num_mask_nodes)]]
+            noise_nodes = mask_nodes[perm_mask[-int(self._replace_rate * num_mask_nodes):]]
+
+            # 选择噪声节点
+            noise_to_be_chosen = torch.randperm(num_nodes, device=x.device)[:num_noise_nodes]
+
+            # 处理输出
+            out_x = x.clone()
+            out_x[token_nodes] = 0.0  # 将掩码节点的特征置为0
+            out_x[noise_nodes] = x[noise_to_be_chosen]  # 用噪声节点替换
+
+        else:
+            out_x = x.clone()
+            token_nodes = mask_nodes
+            out_x[token_nodes] = 0.0  # 将掩码节点的特征置为0
+
+        # 添加掩码标记
+        out_x[token_nodes] += self.enc_mask_token
+
+        # 克隆图数据（如果需要对图进行进一步修改）
+        use_g = g.clone()
+
+        return use_g, out_x, (mask_nodes, keep_nodes)
+    # def forward(self, g, x, difficulty, epoch):
+    #     loss = self.mask_attr_prediction_diff(g, x, difficulty, epoch)
+    #     loss_item = {"loss": loss.item()}
+    #     return loss, loss_item
+
+    def forward(self, g, x):
         loss = self.mask_attr_prediction(g, x)
         # loss = self.mask_attr_prediction(g, x, pr, epoch,  max_epoch)
         loss_item = {"loss": loss.item()}
         return loss, loss_item
-
 
 
     def align_clusters_by_centroids(self, centroids1, centroids2):
@@ -470,7 +650,7 @@ class PreModel(nn.Module):
         centroids = torch.tensor(kmeans.cluster_centers_, device=features.device)  # 聚类质心
         return labels, centroids
 
-    def mask_attr_prediction3(self, g, x):
+    def mask_attr_prediction_origin(self, g, x):
         num_nodes = g.num_nodes()
 
         pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(g, x, self._mask_rate)
@@ -498,8 +678,7 @@ class PreModel(nn.Module):
 
         return loss
 
-    def mask_attr_prediction2(self, g, x):
-    # def mask_attr_prediction(self, g, x, pr, epoch, max_epoch):
+    def mask_attr_prediction_addMaskOriginNode(self, g, x):
         num_nodes = g.num_nodes()
 
         pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(g, x, self._mask_rate)
@@ -634,12 +813,157 @@ class PreModel(nn.Module):
         use_g = pre_use_g
 
         enc_rep_nomask = self.encoder_ema(g, x, )
-        enc_rep_nomask_reduced = self.dimReductionMLP2(F.relu(self.dimReductionMLP(enc_rep_nomask)))  # 通过第一层并应用ReLU激活
+
+        enc_rep_nomask_reduced = self.dimReductionMLP2(F.relu(self.dimReductionMLP(enc_rep_nomask)))
         with torch.no_grad():
-            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048, mask_nodes, k=self.prompt_num)
+            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048,
+                                                                            mask_nodes, k=self.prompt_num)
+        pre_use_g_add_edge = use_g.clone()
+        pre_use_g_add_edge.add_edges(edge_nodeID2, edge_nodeID1)
+        enc_rep, all_hidden = self.encoder(g, use_x, return_hidden=True)
+
+
+        latent_target = self.projector_ema(enc_rep_nomask[keep_nodes])
+        latent_pred = self.projector(enc_rep[keep_nodes])
+        loss_latent = sce_loss(latent_pred, latent_target, self.alpha_l2)
+
+        # mmd_loss = self.compute_mmd(latent_target, latent_pred, sigma=1.0)
+        mmd_loss = self.compute_mmd(latent_target, latent_pred, sigma=1.0)
+
+        # ---- attribute reconstruction ----
+        rep = self.encoder_to_decoder(enc_rep)
+
+        if self._decoder_type not in ("mlp", "linear"):
+            # * remask, re-mask
+            rep[mask_nodes] = 0
+
+        if self._decoder_type in ("mlp", "liear"):
+            recon = self.decoder(rep)
+        else:
+            recon = self.decoder(use_g, rep)
+
+        x_init = x[mask_nodes]
+        x_rec = recon[mask_nodes]
+
+        # loss = self.criterion(x_rec, x_init) + self.loss_weight * loss_latent
+        loss = self.criterion(x_rec, x_init) + self.loss_weight * loss_latent + 0.65 * mmd_loss
+        self.ema_update()
+        return loss
+    def mask_attr_prediction_diff(self, g, x, difficulty, epoch):
+        num_nodes = g.num_nodes()
+
+        pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise_diff_less_proportion(g, x, self._mask_rate,
+                                                                                   difficulty, epoch, 1500)
+
+
+        use_g = pre_use_g
+
+        enc_rep_nomask = self.encoder_ema(g, x, )
+
+        enc_rep_nomask_reduced = self.dimReductionMLP2(F.relu(self.dimReductionMLP(enc_rep_nomask)))
+        with torch.no_grad():
+            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048,
+                                                                            mask_nodes, k=self.prompt_num)
+        pre_use_g_add_edge = use_g.clone()
+        pre_use_g_add_edge.add_edges(edge_nodeID2, edge_nodeID1)
+        enc_rep, all_hidden = self.encoder(g, use_x, return_hidden=True)
+
+
+        latent_target = self.projector_ema(enc_rep_nomask[keep_nodes])
+        latent_pred = self.projector(enc_rep[keep_nodes])
+        loss_latent = sce_loss(latent_pred, latent_target, self.alpha_l2)
+
+        # ---- attribute reconstruction ----
+        rep = self.encoder_to_decoder(enc_rep)
+
+        if self._decoder_type not in ("mlp", "linear"):
+            # * remask, re-mask
+            rep[mask_nodes] = 0
+
+        if self._decoder_type in ("mlp", "liear"):
+            recon = self.decoder(rep)
+        else:
+            recon = self.decoder(use_g, rep)
+
+        x_init = x[mask_nodes]
+        x_rec = recon[mask_nodes]
+
+        loss = self.criterion(x_rec, x_init) + self.loss_weight * loss_latent
+        self.ema_update()
+        return loss
+    def mask_attr_prediction_edge(self, g, x):
+        num_nodes = g.num_nodes()
+
+        pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(g, x, self._mask_rate)
+        use_g = pre_use_g
+
+        enc_rep_nomask = self.encoder_ema(g, x, )
+        enc_rep_nomask_reduced = self.dimReductionMLP2(F.relu(self.dimReductionMLP(enc_rep_nomask)))
+        with torch.no_grad():
+            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048,
+                                                                            mask_nodes, k=self.prompt_num)
+        pre_use_g_add_edge = use_g.clone()
+        pre_use_g_add_edge.add_edges(edge_nodeID2, edge_nodeID1)
+        enc_rep, all_hidden = self.encoder(pre_use_g_add_edge, use_x, return_hidden=True)
+
+        ng, (dsrc, ddst) = self.drop_edge(g, 0.99, True)
+        masked_edges = torch.stack((dsrc, ddst), dim=0)
+
+        # aug_edge_index, _ = add_self_loops(g.edge())
+        # neg_edges = self.negative_sampler(
+        #     torch.stack(g.edges()),
+        #     num_nodes=num_nodes,
+        #     num_neg_samples=dsrc.size(0),
+        # ).view_as(masked_edges)
+        # ng_edge = torch.cat((dsrc, ddst), dim=0)
+        with torch.no_grad():
+            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048,
+                                                                            dsrc, k=1)
+        ng.add_edges(edge_nodeID2, ddst)
+
+        # z = self.encoder(ng, x)
+        z = self.encoder(g, x)
+
+
+        # ******************* loss for edge reconstruction *********************
+        pos_out = self.edge_decoder(z, masked_edges, sigmoid=False)
+        # neg_out = self.edge_decoder(z, neg_edges, sigmoid=False)
+        # loss_edge = ce_loss(pos_out, neg_out)
+        loss_edge = ce_loss(pos_out)
+
+
+        latent_target = self.projector_ema(enc_rep_nomask[keep_nodes])
+        latent_pred = self.projector(enc_rep[keep_nodes])
+        loss_latent = sce_loss(latent_pred, latent_target, self.alpha_l2)
+
+        # ---- attribute reconstruction ----
+        rep = self.encoder_to_decoder(enc_rep)
+
+        if self._decoder_type not in ("mlp", "linear"):
+            # * remask, re-mask
+            rep[mask_nodes] = 0
+
+        if self._decoder_type in ("mlp", "liear"):
+            recon = self.decoder(rep)
+        else:
+            recon = self.decoder(use_g, rep)
+
+        x_init = x[mask_nodes]
+        x_rec = recon[mask_nodes]
+
+        loss = self.criterion(x_rec, x_init) + self.loss_weight * loss_latent + self.loss_weight2 * loss_edge
+        self.ema_update()
+        return loss
+    def mask_attr_prediction6(self, g, x):
+        num_nodes = g.num_nodes()
+
+        pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(g, x, self._mask_rate)
+        use_g = pre_use_g
+
+        enc_rep_nomask = self.encoder_ema(g, x, )
         pre_use_g_add_edge = use_g.clone()
 
-        pre_use_g_add_edge.add_edges(edge_nodeID2, edge_nodeID1)
+        # pre_use_g_add_edge.add_edges(edge_nodeID2, edge_nodeID1)
 
         enc_rep, all_hidden = self.encoder(pre_use_g_add_edge, use_x, return_hidden=True)
 
@@ -670,45 +994,29 @@ class PreModel(nn.Module):
         self.ema_update()
         return loss
 
-    def mask_attr_prediction5(self, g, x):
+    #消融实验
+    def mask_attr_prediction_ablation(self, g, x):
         num_nodes = g.num_nodes()
 
         pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(g, x, self._mask_rate)
-        ng = self.drop_edge(g, 0.3)
-        # pre_use_g2, use_x2, (mask_nodes2, keep_nodes2) = self.encoding_mask_noise(g, x, self._mask_rate)
-
         use_g = pre_use_g
-        #
-        with torch.no_grad():
-            enc_rep_nomask, _ = self.encoder(g, x, return_hidden=True)
 
-        ng_enc_rep, all_hidden = self.encoder(ng, x, return_hidden=True)
-        # enc_rep_nomask = self.encoder_ema(g, x, )
+        enc_rep_nomask = self.encoder_ema(g, x, )
         enc_rep_nomask_reduced = self.dimReductionMLP2(F.relu(self.dimReductionMLP(enc_rep_nomask)))  # 通过第一层并应用ReLU激活
         with torch.no_grad():
-            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048, mask_nodes, k=2)
+            edge_nodeID1, edge_nodeID2 = self.batch_top_k_cosine_similarity(enc_rep_nomask_reduced, 2048, mask_nodes, k=self.prompt_num)
         pre_use_g_add_edge = use_g.clone()
 
         pre_use_g_add_edge.add_edges(edge_nodeID2, edge_nodeID1)
 
         enc_rep, all_hidden = self.encoder(pre_use_g_add_edge, use_x, return_hidden=True)
 
-        # latent_target = self.projector2(ng_enc_rep[keep_nodes])
-        # latent_pred = self.projector(enc_rep[keep_nodes])
-        latent_target = self.projector2(ng_enc_rep)
-        latent_pred = self.projector(enc_rep)
-        loss_latent = sce_loss(latent_pred, latent_target, 3)
-
-
-
         # ---- attribute reconstruction ----
         rep = self.encoder_to_decoder(enc_rep)
-        #
+
         if self._decoder_type not in ("mlp", "linear"):
             # * remask, re-mask
-            # rep[mask_nodes] = self.enc_re_mask_token
             rep[mask_nodes] = 0
-
         if self._decoder_type in ("mlp", "liear"):
             recon = self.decoder(rep)
         else:
@@ -717,8 +1025,7 @@ class PreModel(nn.Module):
         x_init = x[mask_nodes]
         x_rec = recon[mask_nodes]
 
-        # loss = self.criterion(x_rec, x_init)
-        loss = self.criterion(x_rec, x_init) + self.loss_weight * loss_latent
+        loss = self.criterion(x_rec, x_init)
 
         self.ema_update()
         return loss
@@ -804,6 +1111,44 @@ class PreModel(nn.Module):
                 edge_nodeID2.extend(filtered_indices.flatten().tolist())
 
         return edge_nodeID1, edge_nodeID2
+
+    def batch_top_k_dot_similarity(self, x, batch_size, mask_nodes,  k=1):
+        # 提取 mask_nodes 中的特征
+        x_masked = x[mask_nodes]
+        M = x_masked.shape[0]  # mask_nodes 中的节点数
+
+        edge_nodeID1 = []
+        edge_nodeID2 = []
+
+        # 分批计算
+        with torch.no_grad():
+            for i in range(0, M, batch_size):
+                end_i = min(i + batch_size, M)
+                x_masked_batch = x_masked[i:end_i]
+                batch_node_ids = mask_nodes[i:end_i]
+
+                # 批量点积计算：计算 x_masked_batch 和 x 之间的点积
+                similarity_matrix = x_masked_batch @ x.T  # 使用点积而非余弦相似度
+
+                # 筛选 top-k 相似节点（排除自身）
+                top_k_values, top_k_indices = torch.topk(similarity_matrix, k=k + 1, dim=1)
+
+                # 排除自身
+                mask_self = (top_k_indices != batch_node_ids.view(-1, 1))
+                all_true = mask_self.all(dim=1)
+
+                # 针对全 True 行随机设置一个为 False
+                random_indices = torch.randint(0, mask_self.size(1), (all_true.sum().item(),))
+                mask_self[all_true.nonzero().squeeze(), random_indices] = False
+
+                # 筛选最终 top-k 节点
+                filtered_indices = top_k_indices[mask_self].view(similarity_matrix.size(0), -1)[:, :k]
+
+                # 构建边的起点和终点
+                edge_nodeID1.extend(batch_node_ids.repeat_interleave(k).tolist())
+                edge_nodeID2.extend(filtered_indices.flatten().tolist())
+
+        return edge_nodeID1, edge_nodeID2
     def embed(self, g, x):
         rep = self.encoder(g, x)
         return rep
@@ -817,3 +1162,111 @@ class PreModel(nn.Module):
         return chain(*[self.encoder_to_decoder.parameters(), self.decoder.parameters()])
     def decode(self, z, edge_index):
         return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
+
+    def reconstruct_adj_mse(self, g, emb):
+        adj = g.adj().to_dense()
+        adj = adj.to(emb.device)
+        res_adj = (emb @ emb.t())
+        res_adj = F.sigmoid(res_adj)
+        relative_distance = (adj * res_adj).sum() / (res_adj * (1 - adj)).sum()
+        cri = torch.nn.MSELoss()
+        res_loss = cri(adj, res_adj) + F.binary_cross_entropy_with_logits(adj, res_adj)
+        loss = res_loss + relative_distance
+
+        return loss
+
+    def std_loss(self, z):
+        z = self.std_expander(z)
+        z = F.normalize(z, dim=1)
+        std_z = torch.sqrt(z.var(dim=0) + 1e-4)
+        std_loss = torch.mean(F.relu(1 - std_z))
+        return std_loss
+    def gaussian_kernel(self, x, y, sigma=1.0):
+        """
+        计算高斯核函数
+        :param x: 张量，形状为 (n_samples, n_features)
+        :param y: 张量，形状为 (m_samples, n_features)
+        :param sigma: 高斯核的带宽参数
+        :return: 高斯核矩阵
+        """
+        x_norm = torch.sum(x**2, dim=1, keepdim=True)  # (n_samples, 1)
+        y_norm = torch.sum(y**2, dim=1, keepdim=True)  # (m_samples, 1)
+        dist = x_norm + y_norm.T - 2 * torch.matmul(x, y.T)  # (n_samples, m_samples)
+        return torch.exp(-dist / (2 * sigma**2))
+
+    def compute_mmd(self, x, y, sigma=1.0):
+        """
+        计算最大均值差异（MMD）
+        :param x: 张量，形状为 (n_samples, n_features)
+        :param y: 张量，形状为 (m_samples, n_features)
+        :param sigma: 高斯核的带宽参数
+        :return: MMD 值
+        """
+        # 计算核矩阵
+        k_xx = self.gaussian_kernel(x, x, sigma)
+        k_yy = self.gaussian_kernel(y, y, sigma)
+        k_xy = self.gaussian_kernel(x, y, sigma)
+
+        # 计算 MMD
+        n = x.shape[0]
+        m = y.shape[0]
+        mmd = (k_xx.sum() / (n * n) +  # 第一项
+              k_yy.sum() / (m * m) -  # 第二项
+              2 * k_xy.sum() / (n * m))  # 第三项
+        return mmd
+def creat_activation_layer(activation):
+    if activation is None:
+        return nn.Identity()
+    elif activation == "relu":
+        return nn.ReLU()
+    elif activation == "elu":
+        return nn.ELU()
+    else:
+        raise ValueError("Unknown activation")
+
+def ce_loss(pos_out):
+    pos_loss = F.binary_cross_entropy(pos_out.sigmoid(), torch.ones_like(pos_out))
+    # neg_loss = F.binary_cross_entropy(neg_out.sigmoid(), torch.zeros_like(neg_out))
+    # return pos_loss + neg_loss
+    return pos_loss
+class EdgeDecoder(nn.Module):
+    """Simple MLP Edge Decoder"""
+
+    def __init__(
+        self, in_channels, hidden_channels, out_channels=1,
+        num_layers=2, dropout=0.5, activation='relu'
+    ):
+
+        super().__init__()
+        self.mlps = nn.ModuleList()
+
+        for i in range(num_layers):
+            first_channels = in_channels if i == 0 else hidden_channels
+            second_channels = out_channels if i == num_layers - 1 else hidden_channels
+            self.mlps.append(nn.Linear(first_channels, second_channels))
+
+        self.dropout = nn.Dropout(dropout)
+        self.activation = creat_activation_layer(activation)
+
+    def reset_parameters(self):
+        for mlp in self.mlps:
+            mlp.reset_parameters()
+
+    def forward(self, z, edge, sigmoid=True, reduction=False):
+        x = z[edge[0]] * z[edge[1]]
+
+        if reduction:
+            x = x.mean(1)
+
+        for i, mlp in enumerate(self.mlps[:-1]):
+            x = self.dropout(x)
+            x = mlp(x)
+            x = self.activation(x)
+
+        x = self.mlps[-1](x)
+
+        if sigmoid:
+            return x.sigmoid()
+        else:
+            return x
+

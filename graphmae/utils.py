@@ -31,7 +31,6 @@ def set_random_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.determinstic = True
-    torch.backends.cudnn.benchmark = False
 
 def get_current_lr(optimizer):
     return optimizer.state_dict()["param_groups"][0]["lr"]
@@ -100,7 +99,7 @@ def build_args():
     parser.add_argument("--start_rate1", type=float, default=0.3)
     parser.add_argument("--start_rate2", type=float, default=0.5)
     parser.add_argument("--alpha", type=float, default=0.25)
-    parser.add_argument("--momentum", type=float, default=0.996)
+    parser.add_argument("--momentum", type=float, default=1.0)
     parser.add_argument("--start_epoch1", type=int, default=300)
     parser.add_argument("--start_epoch2", type=int, default=500)
     parser.add_argument("--prompt_num", type=int, default=2)

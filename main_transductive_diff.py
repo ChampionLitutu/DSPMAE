@@ -1,8 +1,10 @@
 import logging
 import numpy as np
+from torch_geometric import edge_index
 from tqdm import tqdm
 import torch
-
+import torch_geometric
+from collections import Counter
 from graphmae.utils import (
     build_args,
     create_optimizer,
@@ -22,57 +24,10 @@ import os
 import networkx as nx
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-
-
-def getPagerank(g, device):
-    # 直接从数据中获取边列表和节点数
-    edge_index = g.edges()  # 获取边的元组 (src, dst)
-    num_nodes = g.num_nodes()  # 获取总节点数
-
-    # 创建一个 NetworkX 图
-    nx_graph = nx.Graph()
-
-    # 将边加入 NetworkX 图中
-    # edge_index 是一个元组，包含起始节点和目标节点
-    edge_list = zip(edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy())
-
-    nx_graph.add_edges_from(edge_list)  # 将所有边加入图中
-
-    # 计算 PageRank 值
-    pr = nx.pagerank(nx_graph)
-    pagerank_values = [pr[node] for node in range(num_nodes)]
-
-    # 将 PageRank 值转换为 tensor 并发送到指定设备
-    pagerank_values_tensor = torch.tensor(pagerank_values, device=device)
-
-    return pagerank_values_tensor
-
-
-def select_low_degree_nodes(g, device):
-    # Step 1: 获取图的边索引并构建 NetworkX 图
-    edge_index = g.edges()  # 边的元组 (src, dst)
-    nx_graph = nx.Graph()
-    nx_graph.add_edges_from(zip(edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy()))
-
-    # Step 2: 计算每个节点的度数并转为 PyTorch 张量
-    degrees = torch.tensor([degree for _, degree in nx_graph.degree()], device=device)
-
-    # Step 3: 找出度数最低的 50% 节点的索引
-    # num_nodes_to_select = degrees.size(0) // 2  # 取前 50%
-    # _, low_degree_indices = torch.topk(degrees, k=num_nodes_to_select, largest=False)
-    min_val = degrees.min()
-    max_val = degrees.max()
-
-    # 避免除以零的情况
-    if max_val == min_val:
-        return torch.zeros_like(degrees)
-
-    normalized_degrees = (degrees - min_val) / (max_val - min_val)
-    return normalized_degrees
-
+from sklearn.cluster import KMeans
 
 def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f,
-             max_epoch_f, linear_prob, logger=None):
+             max_epoch_f, linear_prob, difficulty, logger=None):
     logging.info("start training..")
     graph = graph.to(device)
     x = feat.to(device)
@@ -87,10 +42,7 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
     best_nmi = 0
     for epoch in epoch_iter:
         model.train()
-
-        loss, loss_dict = model(graph, x)
-        # loss, loss_dict = model(graph, x)
-
+        loss, loss_dict = model(graph, x, difficulty, epoch)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -98,22 +50,14 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
             scheduler.step()
 
         epoch_iter.set_description(f"# Epoch {epoch}: train_loss: {loss.item():.4f}")
-        # logger.info(f"# Epoch {epoch}: train_loss: {loss.item():.4f}")
-        # if logger is not None:
-        #     loss_dict["lr"] = get_current_lr(optimizer)
-        #     logger.note(loss_dict, step=epoch)
-        # if epoch == 0 or epoch == max_epoch / 2:
-        #     tSNE(model, x, graph, device)
-        # if (epoch + 1) % 200 == 0 and epoch != max_epoch:
-        #     acc, _ = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f,
-        #                                             device, linear_prob, mute=True, logger=logger)
-        #     acc_list.append(acc)
-        #     clustering
-            # clu_acc = node_clustering(model, graph, x, num_classes, epoch, device)
-            #
-            # clu_acc_list.append(clu_acc)
-            # if acc > max_acc:
-            #     max_acc = acc
+
+
+        if (epoch + 1) % 200 == 0 and epoch != max_epoch:
+            acc, _ = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f,
+                                                    device, linear_prob, mute=True, logger=logger)
+            acc_list.append(acc)
+            if acc > max_acc:
+                max_acc = acc
     # logger.info(f"# all_epoch_max_acc: {max(acc_list):.4f}")
     # print(f"# all_epoch_max_acc: {max(acc_list):.4f}")
     # return best_model
@@ -140,6 +84,53 @@ def getLogger(dataset, args):
     # 添加文件处理器到日志器
     logger.addHandler(file_handler)
     return logger
+
+
+def compute_difficulty(pseudo_labels, edge_index):
+    """
+    计算每个节点的难度 D_local(u)
+    pseudo_labels: 每个节点的伪标签张量 [num_nodes]
+    edge_index: 图的边索引，形状为 [2, num_edges]，表示节点的连接关系
+
+    返回 D_local(u) 的张量
+    """
+    edge_index = torch.stack(edge_index, dim=0)
+    num_nodes = pseudo_labels.shape[0]
+    difficulty = torch.zeros(num_nodes)
+
+    # 构建邻接矩阵（邻居信息）
+    adj = torch_geometric.utils.to_dense_adj(edge_index)[0]  # 转换为稠密邻接矩阵
+
+    for u in range(num_nodes):
+        # 获取节点 u 的邻居
+        neighbors = adj[u].nonzero(as_tuple=False).squeeze()  # 获取 u 的邻居节点索引
+        if neighbors.ndimension() == 0:
+            neighbors = neighbors.unsqueeze(0)
+
+        if len(neighbors) == 0:
+            continue  # 如果没有邻居，跳过
+
+        # 获取邻居节点的伪标签
+        neighbor_labels = pseudo_labels[neighbors]
+        if not isinstance(neighbor_labels, np.ndarray):
+            neighbor_labels = np.array([neighbor_labels])
+        # 计算每个类别的概率 P_c(u)
+        label_counts = Counter(neighbor_labels)  # 统计各个标签的数量
+        # label_counts = Counter(neighbor_labels.cpu().numpy())  # 统计各个标签的数量
+        total_neighbors = len(neighbors)
+
+        # 计算 P_c(u) 对于每个类别 c
+        P_c_u = {c: count / total_neighbors for c, count in label_counts.items()}
+
+        # 计算 D_local(u) = - Σ P_c(u) log(P_c(u))
+        D_local_u = 0.0
+        for c, P_c in P_c_u.items():
+            D_local_u -= P_c * torch.log(torch.tensor(P_c))  # 使用 log(P_c(u))
+
+        # 存储计算结果
+        difficulty[u] = D_local_u
+
+    return difficulty
 
 
 def main(args):
@@ -174,30 +165,35 @@ def main(args):
     ari_list = []
     f1_list = []
 
-    # # 模型保存的路径
-    # model_dir = "save_model"
-    # model_name = f"{dataset_name}Model_{time_str}.pth"
-    # save_path = os.path.join(model_dir, model_name)l
-    import random
-    seeds = []
-    seeds = [i for i in range(10)]
-    # for i in range(5):
-    #     seeds.append(3)
+
+    seeds = [i for i in range(1)]
 
     logger = getLogger(dataset_name, args.prompt_num)
     print(f"Random seed used: {seeds}")
     for i, seed in enumerate(seeds):
         print(f"####### Run {i} for seed {seed}")
         set_random_seed(seed)
+
+
         graph, (num_features, num_classes) = load_dataset(dataset_name)
         args.num_features = num_features
+        args.num_classes = num_classes
+
+        logging.info("Saveing Model ...")
+        model_pretrain = build_model(args)
+        model_pretrain.load_state_dict(torch.load("checkpoint_cora0.pt", weights_only=True))
+        model_pretrain = model_pretrain.to(device)
+        x = graph.ndata["feat"]
+
+        with torch.no_grad():
+            features = model_pretrain.embed(graph.to(device), x.to(device))
+        kmeans = KMeans(n_clusters=num_classes, random_state=42, n_init="auto")
+        labels = kmeans.fit_predict(features.cpu().detach().numpy())  # 聚类结果
+        edge_index = graph.edges()
+        difficulty = compute_difficulty(labels, edge_index)
+
         logger.info(args)
 
-        # if logs:
-        #     logger = TBLogger(name=f"{dataset_name}_loss_{loss_fn}_rpr_{replace_rate}_nh_{num_hidden}_nl_{num_layers}_lr_{lr}_mp_{max_epoch}_mpf_{max_epoch_f}_wd_{weight_decay}_wdf_{weight_decay_f}_{encoder_type}_{decoder_type}")
-        # else:
-        #     logger = None
-        args.num_classes = num_classes
         model = build_model(args)
         model.to(device)
         optimizer = create_optimizer(optim_type, model, lr, weight_decay)
@@ -209,35 +205,12 @@ def main(args):
         else:
             scheduler = None
 
-        x = graph.ndata["feat"]
-        if not load_model:
-            model = pretrain(model, graph, x, optimizer, max_epoch, device, scheduler, num_classes, lr_f,
-                             weight_decay_f, max_epoch_f, linear_prob, logger)
-            model = model.cpu()
-
-        if load_model:
-            logging.info("Loading Model ... ")
-            model.load_state_dict(torch.load("checkpoint.pt"))
-        if save_model:
-            logging.info("Saveing Model ...")
-            torch.save(model.state_dict(), "checkpoint_cora0.pt")
+        model = pretrain(model, graph, x, optimizer, max_epoch, device, scheduler, num_classes, lr_f,
+                         weight_decay_f, max_epoch_f, linear_prob, difficulty, logger)
+        model = model.cpu()
 
         model = model.to(device)
         model.eval()
-
-        with torch.no_grad():
-            feature = model.embed(graph.to(device), x.to(device))
-        # final_acc, estp_acc = test_classify(feature.cpu(), graph.ndata["label"])
-
-
-        # with torch.no_grad():
-        #     emb = model.embed(graph.to(device), x.to(device))
-        # train_mask = graph.ndata["train_mask"]
-        # val_mask = graph.ndata["val_mask"]
-        # test_mask = graph.ndata["test_mask"]
-        # labels = graph.ndata["label"]
-        # acc = label_classification(emb, train_mask, val_mask, test_mask, labels)
-
 
         final_acc, estp_acc = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f,
                                                              max_epoch_f, device, linear_prob, logger=logger)
@@ -279,32 +252,6 @@ def main(args):
     logging.info("----------------------------------------------------------------")
 
 
-def tSNE(model, x, graph, device):
-    # 假设以下是编码后的节点表示 (embeddings) 和对应的节点标签 (labels)
-    # embeddings: (N, d), N是节点数，d是编码维度
-    # labels: (N,)，表示节点的类别
-    # 请替换成你的实际数据
-    with torch.no_grad():
-        embeddings = model.embed(graph.to(device), x.to(device))
-    labels = graph.ndata["label"]
-    embeddings = embeddings.cpu().numpy()
-    # 使用 T-SNE 降维到 2D
-    tsne = TSNE(n_components=2, random_state=42, perplexity=150, learning_rate=200, n_iter=5000)
-
-    embeddings_2d = tsne.fit_transform(embeddings)
-    labels = labels.cpu().numpy()
-    # 可视化
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(
-        embeddings_2d[:, 0], embeddings_2d[:, 1], c=labels, cmap='tab10', s=10, alpha=0.8
-    )
-    plt.colorbar(scatter, label="Node Classes")
-    plt.title("My-test")
-    plt.xlabel("T-SNE Dimension 1")
-    plt.ylabel("T-SNE Dimension 2")
-    plt.show()
-
-    # Press the green button in the gutter to run the script.
 
 if __name__ == "__main__":
     args = build_args()

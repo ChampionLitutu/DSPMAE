@@ -9,29 +9,187 @@ from sklearn.multiclass import OneVsRestClassifier
 import numpy as np
 from sklearn.metrics import f1_score
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import KFold
+from sklearn import svm
+from sklearn.metrics import f1_score
+from sklearn.cluster import KMeans
+from sklearn import metrics
+from munkres import Munkres
+from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
+from sklearn.metrics import adjusted_rand_score as ari_score
+from sklearn.preprocessing import normalize, OneHotEncoder
+# from sklearn.linear_model import LogisticRegression
+
+# def test_nc(X_train, y_train, X_test, y_test):
+#     logreg = LogisticRegression(solver='liblinear')
+#     c = 2.0 ** np.arange(-10, 10)
+#
+#     clf = GridSearchCV(estimator=OneVsRestClassifier(logreg),
+#                        param_grid=dict(estimator__C=c), n_jobs=8, cv=5,
+#                        verbose=0)
+#     clf.fit(X_train, y_train)
+#
+#     y_pred = clf.predict_proba(X_test)
+#     y_pred = prob_to_one_hot(y_pred)
+#     acc = accuracy_score(y_test, y_pred)
+#     micro = f1_score(y_test, y_pred, average="micro")
+#     macro = f1_score(y_test, y_pred, average="macro")
+#
+#     return acc, micro, macro
+#
+# def label_classification(embeddings, train_mask, val_mask, test_mask, label):
+#     X = embeddings.detach().cpu().numpy()
+#     Y = label.detach().cpu().numpy()
+#     Y = Y.reshape(-1, 1)
+#     onehot_encoder = OneHotEncoder(categories='auto').fit(Y)
+#     Y = onehot_encoder.transform(Y).toarray().astype(bool)
+#
+#     if np.isinf(X).any() == True or np.isnan(X).any() == True:
+#         return {
+#             'F1Mi': 0,
+#             'F1Ma': 0,
+#             'Acc': 0
+#         }
+#     X = normalize(X, norm='l2')
+#     # if type == 1:
+#         # mask = train_test_split(
+#         #     label.detach().cpu().numpy(), seed=np.random.randint(0, 35456, size=1), train_examples_per_class=20,
+#         #     val_size=500, test_size=None)
+#         #
+#         # X_train = X[mask['train'].astype(bool)]
+#         # X_val = X[mask['val'].astype(bool)]
+#         # X_test = X[mask['test'].astype(bool)]
+#         # y_train = Y[mask['train'].astype(bool)]
+#         # y_val = Y[mask['val'].astype(bool)]
+#         # y_test = Y[mask['test'].astype(bool)]
+#     #     X_train, X_test, y_train, y_test = train_test_split(X, Y,
+#     #                                                         test_size=1 - 0.1)
+#     # else:
+#     X_train = X[train_mask.cpu().numpy()]
+#     X_val = X[val_mask.cpu().numpy()]
+#     X_test = X[test_mask.cpu().numpy()]
+#     y_train = Y[train_mask.cpu().numpy()]
+#     y_val = Y[val_mask.cpu().numpy()]
+#     y_test = Y[test_mask.cpu().numpy()]
+#
+#     acc, micro, macro = test_nc(X_train, y_train, X_test, y_test)
+#
+#     # return {
+#     #     'F1Mi': micro,
+#     #     'F1Ma': macro,
+#     #     'Acc': acc
+#     # }
+#     return acc
+def cluster_acc(y_true, y_pred):
+    y_true = y_true - np.min(y_true)
+
+    l1 = list(set(y_true))
+    numclass1 = len(l1)
+
+    l2 = list(set(y_pred))
+    numclass2 = len(l2)
+
+    if numclass1 != numclass2:
+        print('Error! Class number not equal...')
+        return
+
+    cost = np.zeros((numclass1, numclass2), dtype=int)
+    for i, c1 in enumerate(l1):
+        mps = [i1 for i1, e1 in enumerate(y_true) if e1 == c1]
+        for j, c2 in enumerate(l2):
+            mps_d = [i1 for i1 in mps if y_pred[i1] == c2]
+            cost[i][j] = len(mps_d)
+
+    # match two clustering results by Munkres algorithm
+    m = Munkres()
+    cost = cost.__neg__().tolist()
+    indexes = m.compute(cost)
+
+    # get the match results
+    new_predict = np.zeros(len(y_pred))
+    for i, c in enumerate(l1):
+        # correponding label in l2:
+        c2 = l2[indexes[i][1]]
+
+        # ai is the index with label==c2 in the pred_label list
+        ai = [ind for ind, elm in enumerate(y_pred) if elm == c2]
+        new_predict[ai] = c
+
+    acc = metrics.accuracy_score(y_true, new_predict)
+    f1_macro = metrics.f1_score(y_true, new_predict, average='macro')
+    precision_macro = metrics.precision_score(y_true, new_predict, average='macro')
+    recall_macro = metrics.recall_score(y_true, new_predict, average='macro')
+    f1_micro = metrics.f1_score(y_true, new_predict, average='micro')
+    precision_micro = metrics.precision_score(y_true, new_predict, average='micro')
+    recall_micro = metrics.recall_score(y_true, new_predict, average='micro')
+    return acc, f1_macro
+def eva(y_true, y_pred, state, show):
+    # clustering
+    acc, f1 = cluster_acc(y_true, y_pred)
+    # nmi = nmi_score(y_true, y_pred, average_method='arithmetic')
+    nmi = nmi_score(y_true, y_pred)
+    ari = ari_score(y_true, y_pred)
+
+    if show:
+        print(state, 'clustering acc: {:.4f}'.format(acc), ', nmi {:.4f}'.format(nmi),
+              ', ari {:.4f}'.format(ari), ', f1 {:.4f}'.format(f1))
+    return acc, nmi, ari, f1
+def node_clustering(model, graph, x, num_classes, epoch, device):
+    model.eval()
+
+    with torch.no_grad():
+        emb = model.embed(graph.to(device), x.to(device))
+
+    kmeans = KMeans(n_clusters=num_classes, n_init=20)
+    labels = graph.ndata["label"].cpu().numpy()
+    y_pred = kmeans.fit_predict(emb.cpu().numpy())
+    clu_acc = eva(labels, y_pred, epoch, show=True)
+    return clu_acc
+
 def prob_to_one_hot(y_pred):
-    ret = np.zeros(y_pred.shape, np.bool)
+    ret = np.zeros(y_pred.shape, bool)
     indices = np.argmax(y_pred, axis=1)
     for i in range(y_pred.shape[0]):
         ret[i][indices[i]] = True
     return ret
 
-def test(X_train, y_train, X_test, y_test):
-    logreg = LogisticRegression(solver='liblinear')
-    c = 2.0 ** np.arange(-10, 10)
+# def accuracy_score(preds, labels):
+#     # correct = (preds == labels).astype(float)
+#     correct = (preds == labels).float()
+#
+#     correct = correct.sum()
+#     return correct / len(labels)
 
-    clf = GridSearchCV(estimator=OneVsRestClassifier(logreg),
-                       param_grid=dict(estimator__C=c), n_jobs=8, cv=5,
-                       verbose=0)
-    clf.fit(X_train, y_train)
+def test_classify(feature, labels):
+    f1_mac = []
+    f1_mic = []
+    accs = []
+    kf = KFold(n_splits=5, random_state=42, shuffle=True)
+    for train_index, test_index in kf.split(feature):
+        train_X, train_y = feature[train_index], labels[train_index]
+        test_X, test_y = feature[test_index], labels[test_index]
+        clf = svm.SVC(kernel='rbf', decision_function_shape='ovo')
+        clf.fit(train_X, train_y)
+        preds = clf.predict(test_X)
 
-    y_pred = clf.predict_proba(X_test)
-    y_pred = prob_to_one_hot(y_pred)
-    acc = accuracy_score(y_test, y_pred)
-    micro = f1_score(y_test, y_pred, average="micro")
-    macro = f1_score(y_test, y_pred, average="macro")
+        micro = f1_score(test_y, preds, average='micro')
+        macro = f1_score(test_y, preds, average='macro')
+        acc = accuracy(preds, test_y)
+        accs.append(acc)
+        f1_mac.append(macro)
+        f1_mic.append(micro)
+    f1_mic = np.array(f1_mic)
+    f1_mac = np.array(f1_mac)
+    accs = np.array(accs)
+    f1_mic = np.mean(f1_mic)
+    f1_mac = np.mean(f1_mac)
+    accs = np.mean(accs)
+    print('Testing based on svm: ',
+          'f1_micro=%.4f' % f1_mic,
+          'f1_macro=%.4f' % f1_mac,
+          'acc=%.4f' % accs)
+    return f1_mic, f1_mac, accs
 
-    return acc, micro, macro
 def node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device,
                                    linear_prob=True, mute=False, logger=None):
     model.eval()

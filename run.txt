@@ -1,5 +1,5 @@
 python main_transductive.py --dataset cora --encoder gat --decoder gat --seed 0 --device 0 --use_cfg
-python main_transductive.py --dataset citeseer --encoder gat --decoder gat --seed 0 --device 0 --use_cfg
+
 python main_transductive.py --dataset pubmed --encoder gat --decoder gat --seed 0 --device 0 --use_cfg
 python main_inductive.py --dataset ppi --encoder gat --decoder gat --seed 0 --device 2 --use_cfg
 python main_inductive.py --dataset reddit --encoder gat --decoder gat --seed 0 --device 2 --use_cfg

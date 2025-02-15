@@ -13,60 +13,121 @@ from graphmae.utils import (
 )
 from graphmae.datasets.data_util import load_dataset
 from graphmae.evaluation import node_classification_evaluation
+# from graphmae.evaluation import node_classification_evaluation, test_classify, test_nc, label_classification
 from graphmae.models import build_model
 from datetime import datetime
 from logger import Logger
 import os
 import networkx as nx
-from torch_geometric.utils import train_test_split_edges
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import dgl
+import torch.nn as nn
+import dgl.function as fn
+from sklearn.metrics import roc_auc_score, accuracy_score, adjusted_rand_score, confusion_matrix, f1_score
+import copy
+class DotPredictor(nn.Module):
+    def forward(self, g, h):
+        with g.local_scope():
+            g.ndata["h"] = h
+            g.apply_edges(fn.u_dot_v("h", "h", "score"))
+            return g.edata["score"][:, 0]
 
+def compute_auc(pos_score, neg_score):
+    scores = torch.cat([pos_score, neg_score])
+    labels = torch.cat(
+        [torch.ones(pos_score.shape[0]), torch.zeros(neg_score.shape[0])]
+    )
+    return roc_auc_score(labels.cpu().numpy(), scores.cpu().numpy())
 
-def getPagerank(g, device):
-    # 直接从数据中获取边列表和节点数
-    edge_index = g.edges()  # 获取边的元组 (src, dst)
-    num_nodes = g.num_nodes()  # 获取总节点数
+def link_prediction_for_transductive(model, graph, x, lr_lp, weight_decay_lp, max_epoch, device, test_ratio=0.1, mute=False):
+    model.eval()
+    decoder = DotPredictor()
+    decoder.to(device)
+    optimizer = torch.optim.Adam(
+        [{'params': decoder.parameters()}], lr=lr_lp, weight_decay=weight_decay_lp
+    )
+    criterion = torch.nn.BCEWithLogitsLoss()
+    graph = graph.to(device)
+    x = x.to(device)
 
-    # 创建一个 NetworkX 图
-    nx_graph = nx.Graph()
+    num_nodes = graph.number_of_nodes()
+    u, v = graph.edges()
+    num_edges = graph.number_of_edges()
+    eids = torch.randperm(num_edges).to(device)
+    test_size = int(eids.shape[0] * test_ratio)
+    test_pos_u, test_pos_v = u[eids[:test_size]], v[eids[:test_size]]
+    train_pos_u, train_pos_v = u[eids[test_size:]], v[eids[test_size:]]
 
-    # 将边加入 NetworkX 图中
-    # edge_index 是一个元组，包含起始节点和目标节点
-    edge_list = zip(edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy())
+    num_samples = num_edges
+    neg_u, neg_v = dgl.sampling.global_uniform_negative_sampling(graph, num_samples, exclude_self_loops=True)
+    neg_eids = torch.randperm(num_edges)
+    test_neg_u, test_neg_v = neg_u[neg_eids[:test_size]], neg_v[neg_eids[:test_size]]
+    train_neg_u, train_neg_v = neg_u[neg_eids[test_size:]], neg_v[neg_eids[test_size:]]
 
-    nx_graph.add_edges_from(edge_list)  # 将所有边加入图中
+    train_g = dgl.remove_edges(graph, eids[:test_size])
+    train_g = dgl.add_self_loop(train_g)
+    # test_g = graph.edge_subgraph(eids[:test_size])
+    train_pos_g = dgl.graph((train_pos_u, train_pos_v), num_nodes=num_nodes)
+    train_neg_g = dgl.graph((train_neg_u, train_neg_v), num_nodes=num_nodes)
+    test_pos_g = dgl.graph((test_pos_u, test_pos_v), num_nodes=num_nodes)
+    test_neg_g = dgl.graph((test_neg_u, test_neg_v), num_nodes=num_nodes)
 
-    # 计算 PageRank 值
-    pr = nx.pagerank(nx_graph)
-    pagerank_values = [pr[node] for node in range(num_nodes)]
+    best_test_auc = 0
+    best_epoch = 0
+    best_model = None
 
-    # 将 PageRank 值转换为 tensor 并发送到指定设备
-    pagerank_values_tensor = torch.tensor(pagerank_values, device=device)
+    if not mute:
+        epoch_iter = tqdm(range(max_epoch))
+    else:
+        epoch_iter = range(max_epoch)
 
-    return pagerank_values_tensor
+    for epoch in epoch_iter:
+        model.train()
+        out = model.embed(train_g, train_g.ndata["feat"])
+        pos_score = decoder(train_pos_g, out)
+        neg_score = decoder(train_neg_g, out)
+        loss = criterion(pos_score, neg_score)
+        optimizer.zero_grad()
+        loss.backward()
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3)
+        optimizer.step()
 
+        with torch.no_grad():
+            model.eval()
+            out = model.embed(train_g, train_g.ndata["feat"])
+            pos_score_test = decoder(test_pos_g, out)
+            neg_score_test = decoder(test_neg_g, out)
+            test_auc = compute_auc(pos_score_test, neg_score_test)
+            pos_score_train = decoder(train_pos_g, out)
+            neg_score_train = decoder(train_neg_g, out)
+            train_auc = compute_auc(pos_score_train, neg_score_train)
+            test_loss = criterion(pos_score_test, neg_score_test)
+        if test_auc >= best_test_auc:
+            best_test_auc = test_auc
+            # print('best', best_test_auc)
+            best_epoch = epoch
+            best_model = copy.deepcopy(decoder)
 
-def select_low_degree_nodes(g, device):
-    # Step 1: 获取图的边索引并构建 NetworkX 图
-    edge_index = g.edges()  # 边的元组 (src, dst)
-    nx_graph = nx.Graph()
-    nx_graph.add_edges_from(zip(edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy()))
+        if not mute:
+            epoch_iter.set_description(
+                f"# Epoch: {epoch}, train_loss:{loss.item(): .4f}, train_auc:{train_auc: .4f}, "
+                f"test_loss:{test_loss.item(): .4f}, test_auc:{test_auc: .4f}")
 
-    # Step 2: 计算每个节点的度数并转为 PyTorch 张量
-    degrees = torch.tensor([degree for _, degree in nx_graph.degree()], device=device)
+        best_model.eval()
+        with torch.no_grad():
+            pos_score = best_model(test_pos_g, out)
+            neg_score = best_model(test_neg_g, out)
+            test_auc = compute_auc(pos_score, neg_score)
+        if mute:
+            print(
+                f"# IGNORE: --- TestAUC: {test_auc:.4f}, early-stopping-TestAUC: {best_test_auc:.4f} in epoch {best_epoch} --- ")
+        else:
+            print(
+                f"--- TestAUC: {test_auc:.4f}, early-stopping-TestAUC: {best_test_auc:.4f} in epoch {best_epoch} --- ")
 
-    # Step 3: 找出度数最低的 50% 节点的索引
-    # num_nodes_to_select = degrees.size(0) // 2  # 取前 50%
-    # _, low_degree_indices = torch.topk(degrees, k=num_nodes_to_select, largest=False)
-    min_val = degrees.min()
-    max_val = degrees.max()
-
-    # 避免除以零的情况
-    if max_val == min_val:
-        return torch.zeros_like(degrees)
-
-    normalized_degrees = (degrees - min_val) / (max_val - min_val)
-    return normalized_degrees
-
+        # (final_acc, es_acc, best_acc)
+        return test_auc, best_test_auc
 
 def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f,
              max_epoch_f, linear_prob, logger=None):
@@ -76,14 +137,14 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
 
     # pr = getPagerank(graph, device)
     # degrees = select_low_degree_nodes(graph, device)
-    degrees = getPagerank(graph, device)
+    # degrees = getPagerank(graph, device)
     epoch_iter = tqdm(range(max_epoch))
     acc_list = []
     max_acc = 0.0
     for epoch in epoch_iter:
         model.train()
 
-        loss, loss_dict = model(graph, x, degrees, epoch,  max_epoch)
+        loss, loss_dict = model(graph, x)
         # loss, loss_dict = model(graph, x)
 
         optimizer.zero_grad()
@@ -97,16 +158,14 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
         # if logger is not None:
         #     loss_dict["lr"] = get_current_lr(optimizer)
         #     logger.note(loss_dict, step=epoch)
-
-        if (epoch + 1) % 100 == 0:
-            acc, _ = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f,
-                                                    device, linear_prob, mute=True, logger=logger)
-            acc_list.append(acc)
-            if acc > max_acc:
-                max_acc = acc
-    logger.info(f"# this_epoch_max_acc: {max_acc:.4f}")
+        if (epoch + 1) % 200 == 0 and epoch != max_epoch:
+            test_auc, best_test_auc = link_prediction_for_transductive(model, graph, x, lr_f, weight_decay_f, 70,
+                                             device, test_ratio=0.1, mute=True)
+            print("test_auc: {}, best_test_auc:{}".format(test_auc, best_test_auc))
+            acc_list.append(test_auc)
+            if test_auc > max_acc:
+                max_acc = test_auc
     logger.info(f"# all_epoch_max_acc: {max(acc_list):.4f}")
-    print(f"# this_epoch_max_acc: {max_acc:.4f}")
     print(f"# all_epoch_max_acc: {max(acc_list):.4f}")
     # return best_model
     return model
@@ -123,7 +182,8 @@ def getLogger(dataset, args):
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
 
-    file_handler = logging.FileHandler(f'log/{dataset}_alpha_{args}_{time_str}.log')
+    # file_handler = logging.FileHandler(f'log/{dataset}_momentum_{args}_{time_str}.log')
+    file_handler = logging.FileHandler(f'log/Link_Prediction_{dataset}_GraphMAE_{time_str}.log')
     file_handler.setLevel(logging.INFO)  # 设置处理器级别
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
@@ -157,33 +217,35 @@ def main(args):
     save_model = args.save_model
     logs = args.logging
     use_scheduler = args.scheduler
-    graph, (num_features, num_classes) = load_dataset(dataset_name)
-    args.num_features = num_features
+    momentum = args.momentum
     acc_list = []
     estp_acc_list = []
 
     # # 模型保存的路径
     # model_dir = "save_model"
     # model_name = f"{dataset_name}Model_{time_str}.pth"
-    # save_path = os.path.join(model_dir, model_name)
-    g = train_test_split_edges(graph)
+    # save_path = os.path.join(model_dir, model_name)l
+    import random
+    seeds = []
+    seeds = [i for i in range(10)]
+    # for i in range(5):
+    #     seeds.append(3)
 
-    # 获取训练集、验证集和测试集
-    train_edges = g.edges()[0][g.edata['train_mask']], g.edges()[1][g.edata['train_mask']]
-    val_edges = g.edges()[0][g.edata['val_mask']], g.edges()[1][g.edata['val_mask']]
-    test_edges = g.edges()[0][g.edata['test_mask']], g.edges()[1][g.edata['test_mask']]
+    logger = getLogger(dataset_name, args.prompt_num)
+
+    print(f"Random seed used: {seeds}")
     for i, seed in enumerate(seeds):
         print(f"####### Run {i} for seed {seed}")
         set_random_seed(seed)
-
-        logger = getLogger(dataset_name, args.alpha)
+        graph, (num_features, num_classes) = load_dataset(dataset_name)
+        args.num_features = num_features
         logger.info(args)
 
         # if logs:
         #     logger = TBLogger(name=f"{dataset_name}_loss_{loss_fn}_rpr_{replace_rate}_nh_{num_hidden}_nl_{num_layers}_lr_{lr}_mp_{max_epoch}_mpf_{max_epoch_f}_wd_{weight_decay}_wdf_{weight_decay_f}_{encoder_type}_{decoder_type}")
         # else:
         #     logger = None
-
+        args.num_classes = num_classes
         model = build_model(args)
         model.to(device)
         optimizer = create_optimizer(optim_type, model, lr, weight_decay)
@@ -191,12 +253,10 @@ def main(args):
         if use_scheduler:
             logging.info("Use schedular")
             scheduler = lambda epoch: (1 + np.cos((epoch) * np.pi / max_epoch)) * 0.5
-            # scheduler = lambda epoch: epoch / warmup_steps if epoch < warmup_steps \
-            # else ( 1 + np.cos((epoch - warmup_steps) * np.pi / (max_epoch - warmup_steps))) * 0.5
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
         else:
             scheduler = None
-        data = train_test_split_edges(data)
+
         x = graph.ndata["feat"]
         if not load_model:
             model = pretrain(model, graph, x, optimizer, max_epoch, device, scheduler, num_classes, lr_f,
@@ -213,63 +273,70 @@ def main(args):
         model = model.to(device)
         model.eval()
 
-        final_acc, estp_acc = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f,
-                                                             max_epoch_f, device, linear_prob, logger=logger)
+        # with torch.no_grad():
+        #     feature = model.embed(graph.to(device), x.to(device))
+        # final_acc, estp_acc = test_classify(feature.cpu(), graph.ndata["label"])
+
+
+        # with torch.no_grad():
+        #     emb = model.embed(graph.to(device), x.to(device))
+        # train_mask = graph.ndata["train_mask"]
+        # val_mask = graph.ndata["val_mask"]
+        # test_mask = graph.ndata["test_mask"]
+        # labels = graph.ndata["label"]
+        # # acc = label_classification(emb, train_mask, val_mask, test_mask, labels)
+
+        final_acc, estp_acc = link_prediction_for_transductive(model, graph, x, lr_f, weight_decay_f, 70,
+                                                               device, test_ratio=0.1, mute=True)
+        # acc_list.append(acc)
         acc_list.append(final_acc)
         estp_acc_list.append(estp_acc)
 
+        # logger.info(f"# final_acc: {acc}")
         logger.info(f"# final_acc: {final_acc:.4f}")
         logger.info(f"# early-stopping_acc: {estp_acc:.4f}")
         # if logger is not None:
         #     logger.finish()
+        # tSNE(model, x, graph, device)
     final_acc, final_acc_std = np.mean(acc_list), np.std(acc_list)
     estp_acc, estp_acc_std = np.mean(estp_acc_list), np.std(estp_acc_list)
+    print(f"acc_list:  {acc_list}")
+    print(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
+    print(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
+
     logging.info(f"acc_list:  {acc_list}")
     logging.info(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
     logging.info(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
+    logging.info("----------------------------------------------------------------")
 
 
-def train_test_split_edges(g, test_ratio=0.1, val_ratio=0.05, seed=42):
-    """
-    分割图的边为训练、验证和测试集。
-    """
-    # 设置随机种子
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def tSNE(model, x, graph, device):
+    # 假设以下是编码后的节点表示 (embeddings) 和对应的节点标签 (labels)
+    # embeddings: (N, d), N是节点数，d是编码维度
+    # labels: (N,)，表示节点的类别
+    # 请替换成你的实际数据
+    with torch.no_grad():
+        embeddings = model.embed(graph.to(device), x.to(device))
+    labels = graph.ndata["label"]
+    embeddings = embeddings.cpu().numpy()
+    # 使用 T-SNE 降维到 2D
+    tsne = TSNE(n_components=2, random_state=42, perplexity=100, learning_rate=200, n_iter=2000)
 
-    # 获取图中的所有边
-    u, v = g.edges()
-    num_edges = g.number_of_edges()
+    embeddings_2d = tsne.fit_transform(embeddings)
 
-    # 打乱边的索引
-    perm = np.random.permutation(num_edges)
+    # 可视化
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(
+        embeddings_2d[:, 0], embeddings_2d[:, 1], c=labels, cmap='tab10', s=10, alpha=0.8
+    )
+    plt.colorbar(scatter, label="Node Classes")
+    plt.title("My-test")
+    plt.xlabel("T-SNE Dimension 1")
+    plt.ylabel("T-SNE Dimension 2")
+    plt.show()
 
-    # 计算每个集合的边数
-    test_size = int(num_edges * test_ratio)
-    val_size = int(num_edges * val_ratio)
-    train_size = num_edges - test_size - val_size
+    # Press the green button in the gutter to run the script.
 
-    # 分配边索引到训练、验证和测试集
-    train_edges = perm[:train_size]
-    val_edges = perm[train_size:train_size + val_size]
-    test_edges = perm[train_size + val_size:]
-
-    # 创建掩码
-    edge_train_mask = torch.zeros(num_edges, dtype=torch.bool)
-    edge_val_mask = torch.zeros(num_edges, dtype=torch.bool)
-    edge_test_mask = torch.zeros(num_edges, dtype=torch.bool)
-    edge_train_mask[train_edges] = True
-    edge_val_mask[val_edges] = True
-    edge_test_mask[test_edges] = True
-
-    # 将掩码添加到图的边数据中
-    g.edata['train_mask'] = edge_train_mask
-    g.edata['val_mask'] = edge_val_mask
-    g.edata['test_mask'] = edge_test_mask
-
-    return g
-
-# Press the green button in the gutter to run the script.
 if __name__ == "__main__":
     args = build_args()
     if args.use_cfg:

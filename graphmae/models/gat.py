@@ -98,22 +98,22 @@ class GAT(nn.Module):
             return self.head(h), hidden_list
         else:
             return self.head(h)
-
-    # def forward(self, g, g_prompt, inputs, return_hidden=False):
-    #     if g_prompt is None:
-    #         g_prompt = g
+    # def forward(self, g, inputs, return_hidden=False, g_prompt=None):
     #     h = inputs
     #     hidden_list = []
     #     for l in range(self.num_layers):
-    #         if l < 3:
+    #         if l < 1 and g_prompt is not None:
     #             h = self.gat_layers[l](g_prompt, h)
     #         else:
     #             h = self.gat_layers[l](g, h)
     #         hidden_list.append(h)
+    #         # h = h.flatten(1)
+    #     # output projection
     #     if return_hidden:
     #         return self.head(h), hidden_list
     #     else:
     #         return self.head(h)
+
     def reset_classifier(self, num_classes):
         self.head = nn.Linear(self.num_heads * self.out_dim, num_classes)
 

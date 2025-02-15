@@ -1,2 +1,11 @@
-python main_transductive.py --dataset phy --encoder gat --decoder gat --seed  0 --device 1  --use_cfg
-python main_transductive.py --dataset computer --encoder gat --decoder gat --seed  0 --device 1  --use_cfg
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.99
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.992
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.994
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.996
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.998
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 1.0
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.98
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.97
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.95
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.94
+python main_transductive.py --dataset cora --encoder gat --decoder gat --seed  0 --device 2  --use_cfg --momentum 0.93
