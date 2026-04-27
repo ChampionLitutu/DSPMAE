@@ -103,6 +103,8 @@ def build_args():
     parser.add_argument("--start_epoch1", type=int, default=300)
     parser.add_argument("--start_epoch2", type=int, default=500)
     parser.add_argument("--prompt_num", type=int, default=2)
+    parser.add_argument("--loss_lamda", type=float, default=0.5)
+    parser.add_argument("--loss_weight", type=float, default=0.5)
 
     args = parser.parse_args()
     return args

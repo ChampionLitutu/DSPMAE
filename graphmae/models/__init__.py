@@ -30,6 +30,8 @@ def build_model(args):
     momentum = args.momentum
     alpha_l2 = args.alpha_l2
     prompt_num = args.prompt_num
+    loss_lamda = args.loss_lamda
+    loss_weight = args.loss_weight
     # num_classes = args.num_classes
     model = PreModel(
         in_dim=num_features,
@@ -56,7 +58,8 @@ def build_model(args):
         alpha=alpha,
         momentum=momentum,
         alpha_l2=alpha_l2,
-        prompt_num=prompt_num
-
+        prompt_num=prompt_num,
+        loss_lamda=loss_lamda,
+        loss_weight=loss_weight
     )
     return model

@@ -13,62 +13,12 @@ from graphmae.utils import (
 )
 from graphmae.datasets.data_util import load_dataset
 from graphmae.evaluation import node_classification_evaluation
-# from graphmae.evaluation import node_classification_evaluation, test_classify, test_nc, label_classification
-from graphmae.evaluation import node_clustering
 from graphmae.models import build_model
 from datetime import datetime
-from logger import Logger
-import os
-import networkx as nx
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-
-
-def getPagerank(g, device):
-    # 直接从数据中获取边列表和节点数
-    edge_index = g.edges()  # 获取边的元组 (src, dst)
-    num_nodes = g.num_nodes()  # 获取总节点数
-
-    # 创建一个 NetworkX 图
-    nx_graph = nx.Graph()
-
-    # 将边加入 NetworkX 图中
-    # edge_index 是一个元组，包含起始节点和目标节点
-    edge_list = zip(edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy())
-
-    nx_graph.add_edges_from(edge_list)  # 将所有边加入图中
-
-    # 计算 PageRank 值
-    pr = nx.pagerank(nx_graph)
-    pagerank_values = [pr[node] for node in range(num_nodes)]
-
-    # 将 PageRank 值转换为 tensor 并发送到指定设备
-    pagerank_values_tensor = torch.tensor(pagerank_values, device=device)
-
-    return pagerank_values_tensor
-
-
-def select_low_degree_nodes(g, device):
-    # Step 1: 获取图的边索引并构建 NetworkX 图
-    edge_index = g.edges()  # 边的元组 (src, dst)
-    nx_graph = nx.Graph()
-    nx_graph.add_edges_from(zip(edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy()))
-
-    # Step 2: 计算每个节点的度数并转为 PyTorch 张量
-    degrees = torch.tensor([degree for _, degree in nx_graph.degree()], device=device)
-
-    # Step 3: 找出度数最低的 50% 节点的索引
-    # num_nodes_to_select = degrees.size(0) // 2  # 取前 50%
-    # _, low_degree_indices = torch.topk(degrees, k=num_nodes_to_select, largest=False)
-    min_val = degrees.min()
-    max_val = degrees.max()
-
-    # 避免除以零的情况
-    if max_val == min_val:
-        return torch.zeros_like(degrees)
-
-    normalized_degrees = (degrees - min_val) / (max_val - min_val)
-    return normalized_degrees
+from sklearn.preprocessing import normalize
+import seaborn as sns
 
 
 def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f,
@@ -76,20 +26,13 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
     logging.info("start training..")
     graph = graph.to(device)
     x = feat.to(device)
-
-    # pr = getPagerank(graph, device)
-    # degrees = select_low_degree_nodes(graph, device)
-    # degrees = getPagerank(graph, device)
     epoch_iter = tqdm(range(max_epoch))
-    acc_list = []
-    clu_acc_list = []
-    max_acc = 0.0
-    best_nmi = 0
+
     for epoch in epoch_iter:
         model.train()
 
+        # loss, loss_dict = model(graph, x, epoch)
         loss, loss_dict = model(graph, x)
-        # loss, loss_dict = model(graph, x)
 
         optimizer.zero_grad()
         loss.backward()
@@ -108,12 +51,16 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
         #     acc, _ = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f,
         #                                             device, linear_prob, mute=True, logger=logger)
         #     acc_list.append(acc)
-        #     clustering
-            # clu_acc = node_clustering(model, graph, x, num_classes, epoch, device)
-            #
-            # clu_acc_list.append(clu_acc)
-            # if acc > max_acc:
-            #     max_acc = acc
+        #
+        #     # clu_acc = node_clustering(model, graph, x, num_classes, epoch, device)
+        #
+        #     # clu_acc_list.append(clu_acc)
+        #     if acc > max_acc:
+        #         max_acc = acc
+        # if epoch  == max_epoch / 2:
+        #     tSNE(model, x, graph, device)
+        # if epoch == 0:
+        #     tSNE(model, x, graph, device)
     # logger.info(f"# all_epoch_max_acc: {max(acc_list):.4f}")
     # print(f"# all_epoch_max_acc: {max(acc_list):.4f}")
     # return best_model
@@ -132,7 +79,7 @@ def getLogger(dataset, args):
         logger.removeHandler(handler)
 
     # file_handler = logging.FileHandler(f'log/{dataset}_momentum_{args}_{time_str}.log')
-    file_handler = logging.FileHandler(f'log/1Layer_{dataset}_{args}_GraphMAE_{time_str}.log')
+    file_handler = logging.FileHandler(f'log/{dataset}_{time_str}_{args}__GraphMAE.log')
     file_handler.setLevel(logging.INFO)  # 设置处理器级别
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
@@ -167,6 +114,7 @@ def main(args):
     logs = args.logging
     use_scheduler = args.scheduler
     momentum = args.momentum
+    loss_lamda = args.loss_lamda
     acc_list = []
     estp_acc_list = []
     clu_acc_list = []
@@ -179,12 +127,12 @@ def main(args):
     # model_name = f"{dataset_name}Model_{time_str}.pth"
     # save_path = os.path.join(model_dir, model_name)l
     import random
-    seeds = []
+    # seeds = [0]
     seeds = [i for i in range(10)]
     # for i in range(5):
     #     seeds.append(3)
 
-    logger = getLogger(dataset_name, args.prompt_num)
+    logger = getLogger(dataset_name, args.mask_rate)
     print(f"Random seed used: {seeds}")
     for i, seed in enumerate(seeds):
         print(f"####### Run {i} for seed {seed}")
@@ -230,49 +178,47 @@ def main(args):
         # final_acc, estp_acc = test_classify(feature.cpu(), graph.ndata["label"])
 
 
-        # with torch.no_grad():
-        #     emb = model.embed(graph.to(device), x.to(device))
-        # train_mask = graph.ndata["train_mask"]
-        # val_mask = graph.ndata["val_mask"]
-        # test_mask = graph.ndata["test_mask"]
-        # labels = graph.ndata["label"]
-        # acc = label_classification(emb, train_mask, val_mask, test_mask, labels)
-
-
         final_acc, estp_acc = node_classification_evaluation(model, graph, x, num_classes, lr_f, weight_decay_f,
                                                              max_epoch_f, device, linear_prob, logger=logger)
         # acc_list.append(acc)
         acc_list.append(final_acc)
         estp_acc_list.append(estp_acc)
-        clu_acc_final = node_clustering(model, graph, x, num_classes, 'final', device)
-        clu_acc_list.append(clu_acc_final[0])
+        # clu_acc_final = node_clustering(model, graph, x, num_classes, 'final', device)
+        # clu_acc_list.append(clu_acc_final[0])
         # logger.info(f"# final_acc: {acc}")
         logger.info(f"# final_acc: {final_acc:.4f}")
         logger.info(f"# early-stopping_acc: {estp_acc:.4f}")
-        logger.info(f"# clu_acc_final: {clu_acc_final}")
-        nmi_list.append(clu_acc_final[1])
-        ari_list.append(clu_acc_final[2])
-        f1_list.append(clu_acc_final[3])
+        # logger.info(f"# clu_acc_final: {clu_acc_final}")
+        # nmi_list.append(clu_acc_final[1])
+        # ari_list.append(clu_acc_final[2])
+        # f1_list.append(clu_acc_final[3])
         # if logger is not None:
         #     logger.finish()
-        # tSNE(model, x, graph, device)
+        tSNE(model, x, graph, device)
+        print("show")
+        # plot_hypersphere_distribution(feature, "test")
     final_acc, final_acc_std = np.mean(acc_list), np.std(acc_list)
     estp_acc, estp_acc_std = np.mean(estp_acc_list), np.std(estp_acc_list)
     print(f"acc_list:  {acc_list}")
     print(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
     print(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
-    print(f"clu_acc_final:  {clu_acc_list}")
-    print(f"nmi_acc_final:  {nmi_list}")
-    print(f"ari_acc_final:  {ari_list}")
-    print(f"f1_acc_final:  {f1_list}")
-    print(f"# clu_acc: {np.mean(clu_acc_list):.4f}±{np.std(clu_acc_list):.4f}")
-    print(f"# nmi_acc: {np.mean(nmi_list):.4f}±{np.std(nmi_list):.4f}")
-    print(f"# ari_acc: {np.mean(ari_list):.4f}±{np.std(ari_list):.4f}")
-    print(f"# f1_acc: {np.mean(f1_list):.4f}±{np.std(f1_list):.4f}")
-    logging.info(f"# clu_acc: {np.mean(clu_acc_list):.4f}±{np.std(clu_acc_list):.4f}")
-    logging.info(f"# nmi_acc: {np.mean(nmi_list):.4f}±{np.std(nmi_list):.4f}")
-    logging.info(f"# ari_acc: {np.mean(ari_list):.4f}±{np.std(ari_list):.4f}")
-    logging.info(f"# f1_acc: {np.mean(f1_list):.4f}±{np.std(f1_list):.4f}")
+    # print(f"clu_acc_final:  {clu_acc_list}")
+    # print(f"nmi_acc_final:  {nmi_list}")
+    # print(f"ari_acc_final:  {ari_list}")
+    # print(f"f1_acc_final:  {f1_list}")
+    # print(f"# clu_acc: {np.mean(clu_acc_list):.4f}±{np.std(clu_acc_list):.4f}")
+    # print(f"# nmi_acc: {np.mean(nmi_list):.4f}±{np.std(nmi_list):.4f}")
+    # print(f"# ari_acc: {np.mean(ari_list):.4f}±{np.std(ari_list):.4f}")
+    # print(f"# f1_acc: {np.mean(f1_list):.4f}±{np.std(f1_list):.4f}")
+    #
+    # logging.info(f"clu_acc_final:  {clu_acc_list}")
+    # logging.info(f"nmi_acc_final:  {nmi_list}")
+    # logging.info(f"ari_acc_final:  {ari_list}")
+    # logging.info(f"f1_acc_final:  {f1_list}")
+    # logging.info(f"# clu_acc: {np.mean(clu_acc_list):.4f}±{np.std(clu_acc_list):.4f}")
+    # logging.info(f"# nmi_acc: {np.mean(nmi_list):.4f}±{np.std(nmi_list):.4f}")
+    # logging.info(f"# ari_acc: {np.mean(ari_list):.4f}±{np.std(ari_list):.4f}")
+    # logging.info(f"# f1_acc: {np.mean(f1_list):.4f}±{np.std(f1_list):.4f}")
     logging.info(f"acc_list:  {acc_list}")
     logging.info(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
     logging.info(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
@@ -295,13 +241,18 @@ def tSNE(model, x, graph, device):
     labels = labels.cpu().numpy()
     # 可视化
     plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(
+    # scatter = plt.scatter(
+    #     embeddings_2d[:, 0], embeddings_2d[:, 1], c=labels, cmap='tab10', s=10, alpha=0.8
+    # )
+    plt.scatter(
         embeddings_2d[:, 0], embeddings_2d[:, 1], c=labels, cmap='tab10', s=10, alpha=0.8
     )
-    plt.colorbar(scatter, label="Node Classes")
-    plt.title("My-test")
-    plt.xlabel("T-SNE Dimension 1")
-    plt.ylabel("T-SNE Dimension 2")
+    # plt.colorbar(scatter, label="Node Classes")
+
+
+    # plt.title("Cora")
+    # plt.xlabel("T-SNE Dimension 1")
+    # plt.ylabel("T-SNE Dimension 2")
     plt.show()
 
     # Press the green button in the gutter to run the script.
