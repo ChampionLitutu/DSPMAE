@@ -113,8 +113,6 @@ def main(args):
     save_model = args.save_model
     logs = args.logging
     use_scheduler = args.scheduler
-    momentum = args.momentum
-    loss_lamda = args.loss_lamda
     acc_list = []
     estp_acc_list = []
     clu_acc_list = []
@@ -194,7 +192,7 @@ def main(args):
         # f1_list.append(clu_acc_final[3])
         # if logger is not None:
         #     logger.finish()
-        tSNE(model, x, graph, device)
+        # tSNE(model, x, graph, device)
         print("show")
         # plot_hypersphere_distribution(feature, "test")
     final_acc, final_acc_std = np.mean(acc_list), np.std(acc_list)

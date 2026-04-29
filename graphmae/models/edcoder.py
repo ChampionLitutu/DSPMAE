@@ -282,6 +282,37 @@ class PreModel(nn.Module):
         loss_item = {"loss": loss.item()}
         return loss, loss_item
 
+    def encoding_mask_noise(self, g, x, mask_rate=0.3):
+        num_nodes = g.num_nodes()
+        perm = torch.randperm(num_nodes, device=x.device)
+        num_mask_nodes = int(mask_rate * num_nodes)
+
+        # random masking
+        num_mask_nodes = int(mask_rate * num_nodes)
+        mask_nodes = perm[: num_mask_nodes]
+        keep_nodes = perm[num_mask_nodes: ]
+
+        if self._replace_rate > 0:
+            num_noise_nodes = int(self._replace_rate * num_mask_nodes)
+            perm_mask = torch.randperm(num_mask_nodes, device=x.device)
+            token_nodes = mask_nodes[perm_mask[: int(self._mask_token_rate * num_mask_nodes)]]
+            noise_nodes = mask_nodes[perm_mask[-int(self._replace_rate * num_mask_nodes):]]
+            noise_to_be_chosen = torch.randperm(num_nodes, device=x.device)[:num_noise_nodes]
+
+            out_x = x.clone()
+            out_x[token_nodes] = 0.0
+            out_x[noise_nodes] = x[noise_to_be_chosen]
+        else:
+            # out_x = x.clone()
+            # token_nodes = mask_nodes
+            out_x = x.clone()
+            token_nodes = mask_nodes
+            out_x[token_nodes] = 0.0
+
+        out_x[token_nodes] += self.enc_mask_token
+        use_g = g.clone()
+        return use_g, out_x, (mask_nodes, keep_nodes)
+
 
     def mask_attr_prediction(self, g, x):
         num_nodes = g.num_nodes()
